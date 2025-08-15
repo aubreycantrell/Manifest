@@ -25,9 +25,10 @@ const state = {
   color: "#4d7471",      // current color for NEW additions (including base)
   drawTarget: null,      // mesh we started drawing on
   baseMesh: null,        // the very first/original figure
-  // NEW: robust diagonal handling (collect real surface hits)
+  // robust handling
   surfacePoints3D: [],
   surfaceNormals: [],
+  patchMode: "auto",     // "auto" | "surface" | "perp"
 };
 
 //
@@ -156,7 +157,7 @@ function averageNormal(normals) {
   return n.normalize();
 }
 
-// PCA-based plane normal (smallest-variance direction)
+// PCA-based plane normal (smallest-variance direction), cheap approximation
 function pcaNormal(points) {
   const c = new THREE.Vector3();
   points.forEach(p => c.add(p));
@@ -181,12 +182,12 @@ function pcaNormal(points) {
     new THREE.Vector3(1,-1,0).normalize(), new THREE.Vector3(1,0,-1).normalize(),
     new THREE.Vector3(0,1,-1).normalize(), new THREE.Vector3(1,-1,-1).normalize()
   ];
-  function quadForm(v){
+  function q(v){
     const x=v.x,y=v.y,z=v.z;
     return m[0][0]*x*x + 2*m[0][1]*x*y + 2*m[0][2]*x*z + m[1][1]*y*y + 2*m[1][2]*y*z + m[2][2]*z*z;
   }
   for (const v of dirs){
-    const val = quadForm(v);
+    const val = q(v);
     if (val < bestVal){ bestVal = val; bestV = v.clone(); }
   }
   return bestV.clone().normalize();
@@ -203,8 +204,38 @@ function frameFromNormal(origin, normal) {
   return { matrix:m, inv, xAxis, yAxis, normal, origin };
 }
 
-// Build a patch from true surface 3D points (robust at diagonals)
-function makePatchFromSurfacePoints(worldPts, normals, depth=0.06, eps=0.004) {
+// Stroke direction in world space
+function computeStrokeDirection(worldPts) {
+  if (!worldPts || worldPts.length < 2) return new THREE.Vector3(1,0,0);
+  const dir = worldPts[worldPts.length-1].clone().sub(worldPts[0]);
+  if (dir.lengthSq() < 1e-6) {
+    const s = new THREE.Vector3();
+    for (let i=1;i<worldPts.length;i++) s.add(worldPts[i].clone().sub(worldPts[i-1]));
+    if (s.lengthSq() === 0) return new THREE.Vector3(1,0,0);
+    return s.normalize();
+  }
+  return dir.normalize();
+}
+
+// Decide patch type automatically based on how "edge-on" the surface is
+function decidePatchModeAuto(nAvg, worldPts) {
+  const camDir = new THREE.Vector3();
+  camera.getWorldDirection(camDir); // where the camera looks (world -Z)
+  const faceDot = Math.abs(nAvg.dot(camDir)); // 1 ≈ facing camera, 0 ≈ edge-on
+  const strokeDir = computeStrokeDirection(worldPts);
+  const crossMag = nAvg.clone().cross(strokeDir).length(); // ~0 means degenerate
+
+  // Edge-on surfaces or degenerate stroke vs normal → perpendicular fin helps most
+  const EDGE_ON_DOT = 0.35;   // lower → more edge-on
+  const DEGENERATE = 0.15;    // stroke nearly parallel to normal
+
+  if (faceDot < EDGE_ON_DOT || crossMag < DEGENERATE) return "perp";
+  return "surface";
+}
+
+// Build a patch from true surface 3D points
+// mode: "auto" | "surface" (conformal) | "perp" (perpendicular fin)
+function makePatchFromSurfacePoints(worldPts, normals, depth=0.06, eps=0.004, mode="auto") {
   if (!worldPts || worldPts.length < 3) return null;
 
   const origin = new THREE.Vector3();
@@ -215,13 +246,31 @@ function makePatchFromSurfacePoints(worldPts, normals, depth=0.06, eps=0.004) {
   if (!nAvg || !isFinite(nAvg.x)) nAvg = pcaNormal(worldPts);
   if (!nAvg || nAvg.lengthSq() === 0) nAvg = new THREE.Vector3(0,1,0);
 
-  const frame = frameFromNormal(origin, nAvg);
+  let chosen = mode;
+  if (mode === "auto") chosen = decidePatchModeAuto(nAvg, worldPts);
 
+  let planeNormal;
+  if (chosen === "perp") {
+    const t = computeStrokeDirection(worldPts);
+    planeNormal = nAvg.clone().cross(t).normalize();
+    if (planeNormal.lengthSq() < 1e-6) {
+      const camDir = new THREE.Vector3(); camera.getWorldDirection(camDir);
+      planeNormal = nAvg.clone().cross(camDir).normalize();
+      if (planeNormal.lengthSq() < 1e-6) planeNormal = pcaNormal(worldPts);
+    }
+  } else {
+    planeNormal = nAvg.clone(); // conformal to surface
+  }
+
+  const frame = frameFromNormal(origin, planeNormal);
+
+  // project world points into the chosen plane
   const local2 = worldPts.map(p => {
     const lp = p.clone().applyMatrix4(frame.inv);
     return new THREE.Vector2(lp.x, lp.y);
   });
 
+  // simplify jitter by dropping points too close
   const simplified = [];
   for (const v of local2) {
     const last = simplified[simplified.length-1];
@@ -239,8 +288,9 @@ function makePatchFromSurfacePoints(worldPts, normals, depth=0.06, eps=0.004) {
     depth, bevelEnabled:true, bevelThickness:0.01, bevelSize:0.01, bevelSegments:1, curveSegments:24
   });
 
-  const t = new THREE.Matrix4().makeTranslation(0,0,eps);
-  geom.applyMatrix4(t);
+  // nudge outward along +Z in local, then back to world
+  const tMat = new THREE.Matrix4().makeTranslation(0,0,eps);
+  geom.applyMatrix4(tMat);
   geom.applyMatrix4(frame.matrix);
   return geom;
 }
@@ -291,7 +341,6 @@ function startDraw(e){
     if (hits.length){
       state.drawingOnSurface = true;
       state.drawTarget = findUserMeshRoot(hits[0].object);
-      // optional: capture initial 3D point
       state.surfacePoints3D.push(hits[0].point.clone());
       const n0 = (hits[0].face?.normal || new THREE.Vector3(0,1,0))
         .clone().transformDirection(hits[0].object.matrixWorld).normalize();
@@ -371,10 +420,14 @@ function endDraw(){
   // ADDITIONS (a model already exists)
   if (state.meshes.length > 0) {
     if (state.drawingOnSurface && state.surfacePoints3D.length >= 3){
-      // Build patch aligned to actual surface (robust at diagonal views)
-      const geom = makePatchFromSurfacePoints(state.surfacePoints3D, state.surfaceNormals);
+      const geom = makePatchFromSurfacePoints(
+        state.surfacePoints3D,
+        state.surfaceNormals,
+        0.06,
+        0.004,
+        state.patchMode // "auto" picks for you per stroke
+      );
       if (geom) {
-        // Accept if we started on the model OR patch touches the original figure
         const connectsTarget = !!state.drawTarget;
         const touchesBase    = overlapsBaseFigure(geom, 0.006);
         if (connectsTarget || touchesBase) {
@@ -489,10 +542,9 @@ function applyBaseMeshCentered(geom) {
 
   userGroup.add(mesh);
   state.meshes.push(mesh);
-  state.baseMesh = mesh; // remember the original figure
+  state.baseMesh = mesh;
 
-  // First placement: center view on ORIGIN and sit farther back
-  frameToOrigin(1.8);
+  frameToOrigin(1.8); // first placement only
 }
 
 function make3DFromPoints(points, mode="extrude"){
@@ -523,14 +575,8 @@ applyMode();
 // ---------------------------
 // Reset View helper & button (origin-centered)
 // ---------------------------
-function resetViewToIllustration() {
-  frameToOrigin(1.8);
-}
-
-// Optional desktop shortcut: press "R" to reset view
-addEventListener("keydown", (e) => {
-  if (e.key.toLowerCase?.() === "r") resetViewToIllustration();
-});
+function resetViewToIllustration() { frameToOrigin(1.8); }
+addEventListener("keydown", (e) => { if (e.key.toLowerCase?.() === "r") resetViewToIllustration(); });
 
 //
 // ---------------------------
@@ -568,6 +614,10 @@ const typeBtn  = addButton("Make: Extrude 🍪", () => {
   state.makeMode = state.makeMode === "extrude" ? "lathe" : "extrude";
   typeBtn.textContent = state.makeMode === "extrude" ? "Make: Extrude 🍪" : "Make: Lathe 🏺";
 });
+const patchBtn = addButton("Patch: Auto", () => {
+  state.patchMode = state.patchMode === "auto" ? "surface" : state.patchMode === "surface" ? "perp" : "auto";
+  patchBtn.textContent = state.patchMode === "auto" ? "Patch: Auto" : state.patchMode === "surface" ? "Patch: Surface" : "Patch: Perp ⟂";
+});
 const undoBtn  = addButton("Undo ⬅️", () => {
   const m = state.meshes.pop();
   if (!m) return;
@@ -583,7 +633,7 @@ const clearBtn = addButton("Clear All 🧽", () => {
 });
 const resetBtn = addButton("Reset View 🔄", resetViewToIllustration);
 
-uiBL.append(modeBtn, typeBtn, undoBtn, clearBtn, resetBtn);
+uiBL.append(modeBtn, typeBtn, patchBtn, undoBtn, clearBtn, resetBtn);
 
 //
 // ---------------------------
@@ -795,10 +845,10 @@ function showOnboardingModal() {
     <p style="margin:0 0 12px;font-size:14px;">Quick how-to:</p>
     <ul style="padding-left:18px;margin:0 0 12px;line-height:1.5;font-size:14px;">
       <li><b>Draw anywhere</b> to create your first shape (toggle <i>Make: Extrude/Lathe</i>).</li>
-      <li>After that, <b>tap the model</b> and draw to add raised patches that <b>stick</b> to the surface.</li>
-      <li>Use <b>Mode: Orbit</b> to look around (touch: 1-finger rotate, 2-finger pan/zoom).</li>
-      <li>Pick a <b>color</b> in the top-right. Use <b>Undo/Clear</b> in the bottom-left.</li>
-      <li><b>Save</b> from the top-left (GLB / GLTF / STL / OBJ).</li>
+      <li>After that, draw <b>on the model</b> to add raised patches. The app <b>auto picks</b> Surface vs Perp based on view.</li>
+      <li>Use <b>Patch</b> to force a mode (Auto / Surface / Perp ⟂) if you like.</li>
+      <li>Use <b>Mode: Orbit</b> to look around (touch: 1-finger rotate, 2-finger pan/zoom). Press <b>R</b> to reset view.</li>
+      <li>Pick a <b>color</b> (top-right). Use <b>Undo/Clear</b> (bottom-left). <b>Save</b> via the top-left button.</li>
     </ul>
   `;
 
