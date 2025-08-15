@@ -21,10 +21,13 @@ const state = {
   meshes: [],            // all user-created meshes
   // surface-drawing:
   drawingOnSurface: false,
-  localPoints: [],       // points in picked surface plane's local XY
+  localPoints: [],       // (legacy) local points for plane method
   color: "#4d7471",      // current color for NEW additions (including base)
   drawTarget: null,      // mesh we started drawing on
   baseMesh: null,        // the very first/original figure
+  // NEW: robust diagonal handling (collect real surface hits)
+  surfacePoints3D: [],
+  surfaceNormals: [],
 };
 
 //
@@ -136,46 +139,110 @@ function findUserMeshRoot(obj) {
   return cur || obj;
 }
 
-// Check if the drawn patch is actually connected to the model we started on
-function isConnectedToTarget(localPts, planeInfo, target, geomForBBox) {
-  if (!target || !planeInfo || !localPts?.length) return false;
-
-  // Quick AABB overlap test (reject obvious floaters)
-  if (geomForBBox) {
-    const tmpMesh = new THREE.Mesh(geomForBBox);
-    const patchBox = new THREE.Box3().setFromObject(tmpMesh);
-    const targetBox = new THREE.Box3().setFromObject(target).expandByScalar(0.005);
-    if (!patchBox.intersectsBox(targetBox)) return false;
-  }
-
-  // Sample points and raycast a few mm toward the target's surface
-  const samples = Math.max(4, Math.min(12, Math.ceil(localPts.length / 6)));
-  const step = Math.max(1, Math.floor(localPts.length / samples));
-  let hits = 0;
-
-  const n = planeInfo.normal.clone().normalize();
-  for (let i = 0; i < localPts.length; i += step) {
-    const lp = localPts[i];
-    const world = new THREE.Vector3(lp.x, lp.y, 0).applyMatrix4(planeInfo.matrix);
-    const from = world.clone().addScaledVector(n, 0.01);
-    const dir  = n.clone().multiplyScalar(-1);
-    raycaster.set(from, dir);
-    const isects = raycaster.intersectObject(target, true);
-    if (isects.length && isects[0].distance <= 0.06) hits++;
-  }
-
-  return hits >= 1 && hits >= Math.ceil(samples * 0.3);
-}
-
-// Return true if 'geom' (already in world space) touches or overlaps the original figure
+// Check if a candidate patch touches/overlaps the original figure
 function overlapsBaseFigure(geom, eps = 0.004) {
   if (!state.baseMesh) return false;
-
   const tmpPatch = new THREE.Mesh(geom);
   const patchBox = new THREE.Box3().setFromObject(tmpPatch).expandByScalar(eps);
   const baseBox  = new THREE.Box3().setFromObject(state.baseMesh).expandByScalar(eps);
-
   return patchBox.intersectsBox(baseBox);
+}
+
+// Average a list of normals
+function averageNormal(normals) {
+  const n = new THREE.Vector3();
+  for (const v of normals) n.add(v);
+  if (n.lengthSq() === 0) return null;
+  return n.normalize();
+}
+
+// PCA-based plane normal (smallest-variance direction)
+function pcaNormal(points) {
+  const c = new THREE.Vector3();
+  points.forEach(p => c.add(p));
+  c.multiplyScalar(1 / points.length);
+
+  let xx=0, xy=0, xz=0, yy=0, yz=0, zz=0;
+  for (const p of points) {
+    const x = p.x - c.x, y = p.y - c.y, z = p.z - c.z;
+    xx += x*x; xy += x*y; xz += x*z;
+    yy += y*y; yz += y*z; zz += z*z;
+  }
+  const m = [
+    [xx, xy, xz],
+    [xy, yy, yz],
+    [xz, yz, zz],
+  ];
+  let bestV = new THREE.Vector3(1,0,0), bestVal = Infinity;
+  const dirs = [
+    new THREE.Vector3(1,0,0), new THREE.Vector3(0,1,0), new THREE.Vector3(0,0,1),
+    new THREE.Vector3(1,1,0).normalize(), new THREE.Vector3(1,0,1).normalize(),
+    new THREE.Vector3(0,1,1).normalize(), new THREE.Vector3(1,1,1).normalize(),
+    new THREE.Vector3(1,-1,0).normalize(), new THREE.Vector3(1,0,-1).normalize(),
+    new THREE.Vector3(0,1,-1).normalize(), new THREE.Vector3(1,-1,-1).normalize()
+  ];
+  function quadForm(v){
+    const x=v.x,y=v.y,z=v.z;
+    return m[0][0]*x*x + 2*m[0][1]*x*y + 2*m[0][2]*x*z + m[1][1]*y*y + 2*m[1][2]*y*z + m[2][2]*z*z;
+  }
+  for (const v of dirs){
+    const val = quadForm(v);
+    if (val < bestVal){ bestVal = val; bestV = v.clone(); }
+  }
+  return bestV.clone().normalize();
+}
+
+// Build a frame from normal
+function frameFromNormal(origin, normal) {
+  const up = Math.abs(normal.y) < 0.99 ? new THREE.Vector3(0,1,0) : new THREE.Vector3(1,0,0);
+  const xAxis = new THREE.Vector3().crossVectors(up, normal).normalize();
+  const yAxis = new THREE.Vector3().crossVectors(normal, xAxis).normalize();
+  const m = new THREE.Matrix4().makeBasis(xAxis, yAxis, normal);
+  m.setPosition(origin);
+  const inv = new THREE.Matrix4().copy(m).invert();
+  return { matrix:m, inv, xAxis, yAxis, normal, origin };
+}
+
+// Build a patch from true surface 3D points (robust at diagonals)
+function makePatchFromSurfacePoints(worldPts, normals, depth=0.06, eps=0.004) {
+  if (!worldPts || worldPts.length < 3) return null;
+
+  const origin = new THREE.Vector3();
+  worldPts.forEach(p => origin.add(p));
+  origin.multiplyScalar(1 / worldPts.length);
+
+  let nAvg = normals && normals.length ? averageNormal(normals) : null;
+  if (!nAvg || !isFinite(nAvg.x)) nAvg = pcaNormal(worldPts);
+  if (!nAvg || nAvg.lengthSq() === 0) nAvg = new THREE.Vector3(0,1,0);
+
+  const frame = frameFromNormal(origin, nAvg);
+
+  const local2 = worldPts.map(p => {
+    const lp = p.clone().applyMatrix4(frame.inv);
+    return new THREE.Vector2(lp.x, lp.y);
+  });
+
+  const simplified = [];
+  for (const v of local2) {
+    const last = simplified[simplified.length-1];
+    if (!last || last.distanceTo(v) > 0.003) simplified.push(v);
+  }
+  if (simplified.length < 3) return null;
+
+  const shape = new THREE.Shape();
+  simplified.forEach((p,i)=> i?shape.lineTo(p.x,p.y):shape.moveTo(p.x,p.y));
+  const d = simplified[0].distanceTo(simplified[simplified.length-1]);
+  if (d < 0.02) shape.lineTo(simplified[0].x, simplified[0].y);
+  shape.closePath();
+
+  const geom = new THREE.ExtrudeGeometry(shape, {
+    depth, bevelEnabled:true, bevelThickness:0.01, bevelSize:0.01, bevelSegments:1, curveSegments:24
+  });
+
+  const t = new THREE.Matrix4().makeTranslation(0,0,eps);
+  geom.applyMatrix4(t);
+  geom.applyMatrix4(frame.matrix);
+  return geom;
 }
 
 //
@@ -192,10 +259,10 @@ function frameToOrigin(padFactor = 1.8) {
   const fov = THREE.MathUtils.degToRad(camera.fov);
   const fitH = maxSize / (2 * Math.tan(fov / 2));
   const fitW = fitH / camera.aspect;
-  const dist = padFactor * Math.max(fitH, fitW) + 0.5; // farther back
+  const dist = padFactor * Math.max(fitH, fitW) + 0.5;
 
   const origin = new THREE.Vector3(0, 0, 0);
-  const viewDir = new THREE.Vector3(0.8, 0.5, 1).normalize(); // nice diagonal
+  const viewDir = new THREE.Vector3(0.8, 0.5, 1).normalize();
 
   controls.target.copy(origin);
   camera.position.copy(origin.clone().addScaledVector(viewDir, dist));
@@ -214,17 +281,22 @@ function startDraw(e){
   state.drawing = true;
   state.points = [];
   state.localPoints = [];
+  state.surfacePoints3D = [];
+  state.surfaceNormals  = [];
   toNDC(e);
 
   if (userGroup.children.length){
     raycaster.setFromCamera(ndc, camera);
     const hits = raycaster.intersectObjects(userGroup.children, true);
     if (hits.length){
-      drawPlaneInfo = makeSurfacePlane(hits[0]);
       state.drawingOnSurface = true;
       state.drawTarget = findUserMeshRoot(hits[0].object);
+      // optional: capture initial 3D point
+      state.surfacePoints3D.push(hits[0].point.clone());
+      const n0 = (hits[0].face?.normal || new THREE.Vector3(0,1,0))
+        .clone().transformDirection(hits[0].object.matrixWorld).normalize();
+      state.surfaceNormals.push(n0);
     } else {
-      drawPlaneInfo = null;
       state.drawingOnSurface = false;
       state.drawTarget = null;
     }
@@ -239,21 +311,33 @@ function startDraw(e){
 
 function moveDraw(e){
   if (!state.drawing || state.mode !== "draw") return;
+
   const p = getPt(e);
   const last = state.points[state.points.length-1];
   if (!last || Math.hypot(p.x-last.x, p.y-last.y) > 2){
     state.points.push(p); redrawStroke();
   }
 
-  if (state.drawingOnSurface && drawPlaneInfo){
+  if (state.drawingOnSurface){
     toNDC(e);
     raycaster.setFromCamera(ndc, camera);
-    const world = new THREE.Vector3();
-    if (raycaster.ray.intersectPlane(drawPlaneInfo.plane, world)){
-      const local = world.clone().applyMatrix4(drawPlaneInfo.inv);
-      const lp = state.localPoints[state.localPoints.length-1];
-      if (!lp || new THREE.Vector2(lp.x, lp.y).distanceTo(new THREE.Vector2(local.x, local.y)) > 0.004){
-        state.localPoints.push({ x: local.x, y: local.y });
+    let hit = null;
+    if (state.drawTarget) {
+      const hs = raycaster.intersectObject(state.drawTarget, true);
+      if (hs.length) hit = hs[0];
+    }
+    if (!hit) {
+      const hs = raycaster.intersectObjects(userGroup.children, true);
+      if (hs.length) hit = hs[0];
+    }
+    if (hit){
+      const world = hit.point.clone();
+      const n = (hit.face?.normal || new THREE.Vector3(0,1,0))
+        .clone().transformDirection(hit.object.matrixWorld).normalize();
+      const last3 = state.surfacePoints3D[state.surfacePoints3D.length-1];
+      if (!last3 || last3.distanceTo(world) > 0.003){
+        state.surfacePoints3D.push(world);
+        state.surfaceNormals.push(n);
       }
     }
   }
@@ -284,28 +368,37 @@ function endDraw(){
   if (!state.drawing || state.mode !== "draw") return;
   state.drawing = false;
 
-  // If a model already exists, only add if stroke started on the model OR
-  // the resulting patch touches/overlaps the original (base) figure.
+  // ADDITIONS (a model already exists)
   if (state.meshes.length > 0) {
-    if (state.drawingOnSurface && drawPlaneInfo && state.localPoints.length >= 3){
-      const geom = makePatchOnPlane(state.localPoints, drawPlaneInfo);
-
-      const connectsTarget = isConnectedToTarget(state.localPoints, drawPlaneInfo, state.drawTarget, geom);
-      const touchesBase    = overlapsBaseFigure(geom, 0.004);
-
-      if (connectsTarget || touchesBase) {
-        addMesh(geom); // keep perspective unchanged
+    if (state.drawingOnSurface && state.surfacePoints3D.length >= 3){
+      // Build patch aligned to actual surface (robust at diagonal views)
+      const geom = makePatchFromSurfacePoints(state.surfacePoints3D, state.surfaceNormals);
+      if (geom) {
+        // Accept if we started on the model OR patch touches the original figure
+        const connectsTarget = !!state.drawTarget;
+        const touchesBase    = overlapsBaseFigure(geom, 0.006);
+        if (connectsTarget || touchesBase) {
+          addMesh(geom); // keep perspective unchanged
+        } else {
+          hint("Addition ignored: it must touch the model.");
+        }
       } else {
-        hint("Addition ignored: it must touch the model.");
+        hint("Too few points to add a patch.");
       }
     } else {
       hint("Additions must start on or touch the model.");
     }
-    state.points = []; state.localPoints = []; state.drawTarget = null; redrawStroke();
+
+    state.points = [];
+    state.localPoints = [];
+    state.surfacePoints3D = [];
+    state.surfaceNormals  = [];
+    state.drawTarget = null;
+    redrawStroke();
     return;
   }
 
-  // No model yet → create the base object from the freehand stroke
+  // BASE OBJECT (no model yet)
   make3DFromPoints(state.points, state.makeMode);
   state.points = []; redrawStroke();
 }
@@ -408,10 +501,9 @@ function make3DFromPoints(points, mode="extrude"){
   const geom = (mode === "lathe") ? makeLathe(norm) : makeExtrude(norm);
 
   if (state.meshes.length === 0) {
-    // First object: center on the floor at origin and center the view to origin
     applyBaseMeshCentered(geom);
   } else {
-    // Later objects are only added from endDraw() when stroke started on/touched model
+    // Later objects are only added from endDraw() when valid
   }
 }
 
@@ -432,7 +524,7 @@ applyMode();
 // Reset View helper & button (origin-centered)
 // ---------------------------
 function resetViewToIllustration() {
-  frameToOrigin(1.8); // tweak pad if you want closer/farther
+  frameToOrigin(1.8);
 }
 
 // Optional desktop shortcut: press "R" to reset view
@@ -479,7 +571,7 @@ const typeBtn  = addButton("Make: Extrude 🍪", () => {
 const undoBtn  = addButton("Undo ⬅️", () => {
   const m = state.meshes.pop();
   if (!m) return;
-  if (m === state.baseMesh) state.baseMesh = null; // if you undo the original
+  if (m === state.baseMesh) state.baseMesh = null;
   userGroup.remove(m);
   m.geometry.dispose(); m.material.dispose();
 });
