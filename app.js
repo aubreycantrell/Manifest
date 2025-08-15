@@ -24,6 +24,7 @@ const state = {
   localPoints: [],       // points in picked surface plane's local XY
   color: "#4d7471",      // current color for NEW additions (including base)
   drawTarget: null,      // mesh we started drawing on
+  baseMesh: null,        // the very first/original figure
 };
 
 //
@@ -166,12 +167,22 @@ function isConnectedToTarget(localPts, planeInfo, target, geomForBBox) {
   return hits >= 1 && hits >= Math.ceil(samples * 0.3);
 }
 
+// Return true if 'geom' (already in world space) touches or overlaps the original figure
+function overlapsBaseFigure(geom, eps = 0.004) {
+  if (!state.baseMesh) return false;
+
+  const tmpPatch = new THREE.Mesh(geom);
+  const patchBox = new THREE.Box3().setFromObject(tmpPatch).expandByScalar(eps);
+  const baseBox  = new THREE.Box3().setFromObject(state.baseMesh).expandByScalar(eps);
+
+  return patchBox.intersectsBox(baseBox);
+}
+
 //
 // ---------------------------
 // Origin-centered framing (reset + first placement)
 // ---------------------------
 function frameToOrigin(padFactor = 1.8) {
-  // Estimate distance from current content; if empty, use size=1
   const box = new THREE.Box3().setFromObject(userGroup);
   let maxSize = 1;
   if (isFinite(box.min.x)) {
@@ -273,17 +284,22 @@ function endDraw(){
   if (!state.drawing || state.mode !== "draw") return;
   state.drawing = false;
 
-  // If a model already exists, only add if the stroke STARTED on the model AND is connected
+  // If a model already exists, only add if stroke started on the model OR
+  // the resulting patch touches/overlaps the original (base) figure.
   if (state.meshes.length > 0) {
     if (state.drawingOnSurface && drawPlaneInfo && state.localPoints.length >= 3){
       const geom = makePatchOnPlane(state.localPoints, drawPlaneInfo);
-      if (isConnectedToTarget(state.localPoints, drawPlaneInfo, state.drawTarget, geom)) {
+
+      const connectsTarget = isConnectedToTarget(state.localPoints, drawPlaneInfo, state.drawTarget, geom);
+      const touchesBase    = overlapsBaseFigure(geom, 0.004);
+
+      if (connectsTarget || touchesBase) {
         addMesh(geom); // keep perspective unchanged
       } else {
-        hint("Addition ignored: it must stay on the model.");
+        hint("Addition ignored: it must touch the model.");
       }
     } else {
-      hint("Additions must start on the model.");
+      hint("Additions must start on or touch the model.");
     }
     state.points = []; state.localPoints = []; state.drawTarget = null; redrawStroke();
     return;
@@ -380,6 +396,7 @@ function applyBaseMeshCentered(geom) {
 
   userGroup.add(mesh);
   state.meshes.push(mesh);
+  state.baseMesh = mesh; // remember the original figure
 
   // First placement: center view on ORIGIN and sit farther back
   frameToOrigin(1.8);
@@ -394,7 +411,7 @@ function make3DFromPoints(points, mode="extrude"){
     // First object: center on the floor at origin and center the view to origin
     applyBaseMeshCentered(geom);
   } else {
-    // Later objects are only added from endDraw() when stroke started on model
+    // Later objects are only added from endDraw() when stroke started on/touched model
   }
 }
 
@@ -462,6 +479,7 @@ const typeBtn  = addButton("Make: Extrude 🍪", () => {
 const undoBtn  = addButton("Undo ⬅️", () => {
   const m = state.meshes.pop();
   if (!m) return;
+  if (m === state.baseMesh) state.baseMesh = null; // if you undo the original
   userGroup.remove(m);
   m.geometry.dispose(); m.material.dispose();
 });
@@ -469,6 +487,7 @@ const clearBtn = addButton("Clear All 🧽", () => {
   state.points = []; state.localPoints = []; redrawStroke();
   state.meshes.forEach(m => { userGroup.remove(m); m.geometry.dispose(); m.material.dispose(); });
   state.meshes = [];
+  state.baseMesh = null;
 });
 const resetBtn = addButton("Reset View 🔄", resetViewToIllustration);
 
