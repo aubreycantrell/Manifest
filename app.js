@@ -23,7 +23,7 @@ const state = {
   drawingOnSurface: false,
   localPoints: [],       // points in picked surface plane's local XY
   color: "#4d7471",      // current color for NEW additions (including base)
-  originWorld: null,     // world point of the FIRST drawing point
+  drawTarget: null,      // mesh we started drawing on
 };
 
 //
@@ -63,7 +63,7 @@ function redrawStroke() {
 
 //
 // ---------------------------
-// THREE scene
+/** THREE scene */
 // ---------------------------
 const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
 document.body.appendChild(renderer.domElement);
@@ -71,11 +71,7 @@ Object.assign(renderer.domElement.style, { position: "fixed", inset: "0", zIndex
 renderer.setPixelRatio(Math.min(2, dpr));
 
 const scene = new THREE.Scene();
-
-// Everything the user creates lives under originGroup → we can shift it so that the
-// FIRST drawing point becomes (0,0,0) in world space.
-const originGroup = new THREE.Group(); scene.add(originGroup);
-const userGroup = new THREE.Group(); originGroup.add(userGroup);
+const userGroup = new THREE.Group(); scene.add(userGroup);
 
 const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.1, 100);
 camera.position.set(0, 1.2, 4);
@@ -114,22 +110,6 @@ function toNDC(e){
   ndc.set(x,y);
 }
 
-// helpers for projecting to the floor
-function ndcFromClient(x, y) {
-  const r = renderer.domElement.getBoundingClientRect();
-  return new THREE.Vector2(((x - r.left) / r.width) * 2 - 1, -((y - r.top) / r.height) * 2 + 1);
-}
-function screenPointToFloorWorld(clientX, clientY) {
-  const ndc = ndcFromClient(clientX, clientY);
-  raycaster.setFromCamera(ndc, camera);
-  const floorPlane = new THREE.Plane().setFromNormalAndCoplanarPoint(
-    new THREE.Vector3(0, 1, 0),
-    new THREE.Vector3(0, floor.position.y, 0)
-  );
-  const p = new THREE.Vector3();
-  return raycaster.ray.intersectPlane(floorPlane, p) ? p : new THREE.Vector3(0, floor.position.y, 0);
-}
-
 function makeSurfacePlane(hit){
   const n = (hit.face?.normal || new THREE.Vector3(0,1,0))
     .clone()
@@ -148,6 +128,44 @@ function makeSurfacePlane(hit){
   return { plane, matrix: m, inv, normal: n, position: p };
 }
 
+// Find the top-level mesh under userGroup for a hit object
+function findUserMeshRoot(obj) {
+  let cur = obj;
+  while (cur && cur.parent && cur.parent !== userGroup) cur = cur.parent;
+  return cur || obj;
+}
+
+// Check if the drawn patch is actually connected to the model we started on
+function isConnectedToTarget(localPts, planeInfo, target, geomForBBox) {
+  if (!target || !planeInfo || !localPts?.length) return false;
+
+  // Quick AABB overlap test (reject obvious floaters)
+  if (geomForBBox) {
+    const tmpMesh = new THREE.Mesh(geomForBBox);
+    const patchBox = new THREE.Box3().setFromObject(tmpMesh);
+    const targetBox = new THREE.Box3().setFromObject(target).expandByScalar(0.005);
+    if (!patchBox.intersectsBox(targetBox)) return false;
+  }
+
+  // Sample points and raycast a few mm toward the target's surface
+  const samples = Math.max(4, Math.min(12, Math.ceil(localPts.length / 6)));
+  const step = Math.max(1, Math.floor(localPts.length / samples));
+  let hits = 0;
+
+  const n = planeInfo.normal.clone().normalize();
+  for (let i = 0; i < localPts.length; i += step) {
+    const lp = localPts[i];
+    const world = new THREE.Vector3(lp.x, lp.y, 0).applyMatrix4(planeInfo.matrix);
+    const from = world.clone().addScaledVector(n, 0.01);
+    const dir  = n.clone().multiplyScalar(-1);
+    raycaster.set(from, dir);
+    const isects = raycaster.intersectObject(target, true);
+    if (isects.length && isects[0].distance <= 0.06) hits++;
+  }
+
+  return hits >= 1 && hits >= Math.ceil(samples * 0.3);
+}
+
 //
 // ---------------------------
 // Drawing events
@@ -159,24 +177,21 @@ function startDraw(e){
   state.localPoints = [];
   toNDC(e);
 
-  // If this is the first ever stroke, capture the FIRST drawing point in world as the origin
-  if (state.meshes.length === 0 && state.originWorld === null) {
-    const p0 = getPt(e);
-    state.originWorld = screenPointToFloorWorld(p0.x, p0.y); // world-space anchor on the floor
-  }
-
   if (userGroup.children.length){
     raycaster.setFromCamera(ndc, camera);
     const hits = raycaster.intersectObjects(userGroup.children, true);
     if (hits.length){
       drawPlaneInfo = makeSurfacePlane(hits[0]);
       state.drawingOnSurface = true;
+      state.drawTarget = findUserMeshRoot(hits[0].object);
     } else {
       drawPlaneInfo = null;
       state.drawingOnSurface = false;
+      state.drawTarget = null;
     }
   } else {
     state.drawingOnSurface = false; // first/base object
+    state.drawTarget = null;
   }
 
   state.points.push(getPt(e));
@@ -205,7 +220,7 @@ function moveDraw(e){
   }
 }
 
-// tiny hint helper
+// hint toast
 let hintTimer = null;
 function hint(msg){
   if (hintTimer) clearTimeout(hintTimer);
@@ -230,15 +245,19 @@ function endDraw(){
   if (!state.drawing || state.mode !== "draw") return;
   state.drawing = false;
 
-  // If a model already exists, only add if the stroke STARTED on the model
+  // If a model already exists, only add if the stroke STARTED on the model AND is connected
   if (state.meshes.length > 0) {
     if (state.drawingOnSurface && drawPlaneInfo && state.localPoints.length >= 3){
       const geom = makePatchOnPlane(state.localPoints, drawPlaneInfo);
-      addMesh(geom); // no camera change
+      if (isConnectedToTarget(state.localPoints, drawPlaneInfo, state.drawTarget, geom)) {
+        addMesh(geom); // keep perspective
+      } else {
+        hint("Addition ignored: it must stay on the model.");
+      }
     } else {
       hint("Additions must start on the model.");
     }
-    state.points = []; state.localPoints = []; redrawStroke();
+    state.points = []; state.localPoints = []; state.drawTarget = null; redrawStroke();
     return;
   }
 
@@ -323,11 +342,9 @@ function addMesh(geom){
 function applyBaseMeshCentered(geom) {
   if (!geom) return;
 
-  // Material + mesh
   const mat = new THREE.MeshStandardMaterial({ color: state.color, metalness: 0.05, roughness: 0.6 });
   const mesh = new THREE.Mesh(geom, mat);
 
-  // Make sure geometry is centered, then rest it on the floor and center XZ at (0,0)
   geom.computeBoundingBox();
   const minY = geom.boundingBox.min.y;
   const pad = 0.02;
@@ -336,7 +353,7 @@ function applyBaseMeshCentered(geom) {
   userGroup.add(mesh);
   state.meshes.push(mesh);
 
-  // Recenter the camera/controls ONCE to the mesh center, preserving distance/orientation
+  // Recenter camera/controls once to the mesh center, preserving offset
   const oldTarget = controls.target.clone();
   const offset = camera.position.clone().sub(oldTarget);
 
@@ -346,20 +363,10 @@ function applyBaseMeshCentered(geom) {
 
   camera.position.copy(newTarget.clone().add(offset));
   controls.target.copy(newTarget);
+  camera.near = Math.max(0.01, camera.near);
+  camera.far  = Math.max(100,  camera.far);
+  camera.updateProjectionMatrix();
   controls.update();
-}
-
-
-function applyMesh(geom){
-  if (!geom) return;
-  geom.center(); geom.computeBoundingBox(); geom.computeBoundingSphere();
-  const mat = new THREE.MeshStandardMaterial({ color: state.color, metalness: 0.05, roughness: 0.6 });
-  const mesh = new THREE.Mesh(geom, mat);
-  const minY = geom.boundingBox.min.y;
-  const pad = 0.02;
-  mesh.position.set(0, floor.position.y - minY + pad, 0);
-  userGroup.add(mesh);
-  state.meshes.push(mesh);
 }
 
 function make3DFromPoints(points, mode="extrude"){
@@ -371,11 +378,9 @@ function make3DFromPoints(points, mode="extrude"){
     // First object: center on the floor at origin and center the view
     applyBaseMeshCentered(geom);
   } else {
-    // Later objects: only added from endDraw() when stroke started on model
-    // (no camera changes)
+    // Later objects are only added from endDraw() when stroke started on model
   }
 }
-
 
 //
 // ---------------------------
@@ -388,6 +393,36 @@ function applyMode(){
   controls.enabled = !drawOn;
 }
 applyMode();
+
+//
+// ---------------------------
+// Reset View helper & button
+// ---------------------------
+function resetViewToIllustration() {
+  const box = new THREE.Box3().setFromObject(userGroup);
+  if (!isFinite(box.min.x)) return; // nothing yet
+  const center = new THREE.Vector3();
+  const size   = new THREE.Vector3();
+  box.getCenter(center);
+  box.getSize(size);
+
+  let dir = camera.position.clone().sub(controls.target);
+  if (dir.lengthSq() === 0) dir = new THREE.Vector3(0, 0.5, 1);
+  dir.normalize();
+
+  const maxSize = Math.max(size.x, size.y, size.z);
+  const fov     = THREE.MathUtils.degToRad(camera.fov);
+  const fitH    = maxSize / (2 * Math.tan(fov / 2));
+  const fitW    = fitH / camera.aspect;
+  const dist    = 1.2 * Math.max(fitH, fitW); // 20% padding
+
+  controls.target.copy(center);
+  camera.position.copy(center.clone().addScaledVector(dir, dist));
+  camera.near = Math.max(0.01, dist / 100);
+  camera.far  = Math.max(100,  dist * 10);
+  camera.updateProjectionMatrix();
+  controls.update();
+}
 
 //
 // ---------------------------
@@ -421,28 +456,24 @@ const modeBtn = addButton("Mode: Draw ✍️", () => {
   modeBtn.textContent = state.mode === "draw" ? "Mode: Draw ✍️" : "Mode: Orbit 🌀";
   applyMode();
 });
-
 const typeBtn = addButton("Make: Extrude 🍪", () => {
   state.makeMode = state.makeMode === "extrude" ? "lathe" : "extrude";
   typeBtn.textContent = state.makeMode === "extrude" ? "Make: Extrude 🍪" : "Make: Lathe 🏺";
 });
-
 const undoBtn = addButton("Undo ⬅️", () => {
   const m = state.meshes.pop();
   if (!m) return;
   userGroup.remove(m);
   m.geometry.dispose(); m.material.dispose();
-  // keep the view as-is
 });
-
 const clearBtn = addButton("Clear All 🧽", () => {
   state.points = []; state.localPoints = []; redrawStroke();
   state.meshes.forEach(m => { userGroup.remove(m); m.geometry.dispose(); m.material.dispose(); });
   state.meshes = [];
-  // keep the view as-is (originGroup stays where it is so (0,0,0) is still the first point)
 });
+const resetBtn = addButton("Reset View 🔄", resetViewToIllustration);
 
-uiBL.append(modeBtn, typeBtn, undoBtn, clearBtn);
+uiBL.append(modeBtn, typeBtn, undoBtn, clearBtn, resetBtn);
 
 //
 // ---------------------------
@@ -529,7 +560,6 @@ function ensureExportable() {
   userGroup.updateMatrixWorld(true);
   return true;
 }
-
 function makeMenuItem(label, onClick) {
   const item = document.createElement("button");
   item.textContent = label;
@@ -545,10 +575,7 @@ function makeMenuItem(label, onClick) {
     fontFamily: "system-ui,-apple-system,Segoe UI,Roboto,sans-serif",
     fontSize: "14px"
   });
-  item.addEventListener("click", () => {
-    hideMenu();
-    onClick();
-  });
+  item.addEventListener("click", () => { hideMenu(); onClick(); });
   item.addEventListener("mouseenter", () => item.style.background = "#f3f3f3");
   item.addEventListener("mouseleave", () => item.style.background = "white");
   return item;
@@ -605,7 +632,6 @@ menu.appendChild(makeMenuItem("GLB (glTF 2.0, binary)", () => {
     { binary: true, onlyVisible: true, forceIndices: true, includeCustomExtensions: false }
   );
 }));
-
 menu.appendChild(makeMenuItem("GLTF (glTF 2.0, JSON)", () => {
   if (!ensureExportable()) return;
   const exporter = new GLTFExporter();
@@ -615,14 +641,12 @@ menu.appendChild(makeMenuItem("GLTF (glTF 2.0, JSON)", () => {
     { binary: false, onlyVisible: true, forceIndices: true, includeCustomExtensions: false }
   );
 }));
-
 menu.appendChild(makeMenuItem("STL (geometry only)", () => {
   if (!ensureExportable()) return;
   const exporter = new STLExporter();
   const arrayBuffer = exporter.parse(userGroup, { binary: true });
   saveBlob(new Blob([arrayBuffer], { type: "model/stl" }), "drawing-3d.stl");
 }));
-
 menu.appendChild(makeMenuItem("OBJ (geometry + groups)", () => {
   if (!ensureExportable()) return;
   const exporter = new OBJExporter();
@@ -669,12 +693,7 @@ function showOnboardingModal() {
   `;
 
   const row = document.createElement("div");
-  Object.assign(row.style, {
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-    gap: "8px",
-  });
+  Object.assign(row.style, { display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px" });
 
   const label = document.createElement("label");
   Object.assign(label.style, { fontSize: "13px", display: "flex", alignItems: "center", gap: "8px" });
@@ -685,20 +704,12 @@ function showOnboardingModal() {
   const ok = document.createElement("button");
   ok.textContent = "Got it";
   Object.assign(ok.style, {
-    fontSize: "16px",
-    padding: "10px 14px",
-    borderRadius: "14px",
-    border: "0",
-    background: "#4d7471",
-    color: "white",
-    cursor: "pointer",
-    boxShadow: "0 2px 8px rgba(0,0,0,.15)",
+    fontSize: "16px", padding: "10px 14px", borderRadius: "14px", border: "0",
+    background: "#4d7471", color: "white", cursor: "pointer", boxShadow: "0 2px 8px rgba(0,0,0,.15)",
   });
 
   function close() {
-    if (cb.checked) {
-      try { localStorage.setItem("drawing3d_onboarded", "1"); } catch {}
-    }
+    if (cb.checked) { try { localStorage.setItem("drawing3d_onboarded", "1"); } catch {} }
     window.removeEventListener("keydown", onKey);
     overlay.remove();
   }
