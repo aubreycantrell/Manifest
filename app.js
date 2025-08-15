@@ -15,14 +15,15 @@ import { OBJExporter } from "https://unpkg.com/three@0.161/examples/jsm/exporter
 // ---------------------------
 const state = {
   drawing: false,
-  points: [],           // screen-space points for base strokes
-  mode: "draw",         // "draw" | "orbit"
-  makeMode: "extrude",  // "extrude" | "lathe"  (for the first/base object)
-  meshes: [],           // all user-created meshes
+  points: [],            // screen-space points for base strokes
+  mode: "draw",          // "draw" | "orbit"
+  makeMode: "extrude",   // "extrude" | "lathe"
+  meshes: [],            // all user-created meshes
   // surface-drawing:
   drawingOnSurface: false,
-  localPoints: [],      // points in picked surface plane's local XY
-  color: "#4d7471",     // current color for NEW additions (including base)
+  localPoints: [],       // points in picked surface plane's local XY
+  color: "#4d7471",      // current color for NEW additions (including base)
+  originWorld: null,     // world point of the FIRST drawing point
 };
 
 //
@@ -70,7 +71,11 @@ Object.assign(renderer.domElement.style, { position: "fixed", inset: "0", zIndex
 renderer.setPixelRatio(Math.min(2, dpr));
 
 const scene = new THREE.Scene();
-const userGroup = new THREE.Group(); scene.add(userGroup);
+
+// Everything the user creates lives under originGroup → we can shift it so that the
+// FIRST drawing point becomes (0,0,0) in world space.
+const originGroup = new THREE.Group(); scene.add(originGroup);
+const userGroup = new THREE.Group(); originGroup.add(userGroup);
 
 const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.1, 100);
 camera.position.set(0, 1.2, 4);
@@ -109,7 +114,7 @@ function toNDC(e){
   ndc.set(x,y);
 }
 
-// === helpers for centering first object under the stroke ===
+// helpers for projecting to the floor
 function ndcFromClient(x, y) {
   const r = renderer.domElement.getBoundingClientRect();
   return new THREE.Vector2(((x - r.left) / r.width) * 2 - 1, -((y - r.top) / r.height) * 2 + 1);
@@ -154,6 +159,12 @@ function startDraw(e){
   state.localPoints = [];
   toNDC(e);
 
+  // If this is the first ever stroke, capture the FIRST drawing point in world as the origin
+  if (state.meshes.length === 0 && state.originWorld === null) {
+    const p0 = getPt(e);
+    state.originWorld = screenPointToFloorWorld(p0.x, p0.y); // world-space anchor on the floor
+  }
+
   if (userGroup.children.length){
     raycaster.setFromCamera(ndc, camera);
     const hits = raycaster.intersectObjects(userGroup.children, true);
@@ -194,18 +205,44 @@ function moveDraw(e){
   }
 }
 
+// tiny hint helper
+let hintTimer = null;
+function hint(msg){
+  if (hintTimer) clearTimeout(hintTimer);
+  let el = document.getElementById("hint-toast");
+  if (!el){
+    el = document.createElement("div");
+    el.id = "hint-toast";
+    Object.assign(el.style, {
+      position: "fixed", bottom: "16px", left: "50%", transform: "translateX(-50%)",
+      background: "rgba(0,0,0,.75)", color: "white", padding: "8px 12px",
+      borderRadius: "12px", fontFamily: "system-ui,-apple-system,Segoe UI,Roboto,sans-serif",
+      fontSize: "13px", zIndex: "9999", pointerEvents: "none", transition: "opacity .2s"
+    });
+    document.body.appendChild(el);
+  }
+  el.textContent = msg;
+  el.style.opacity = "1";
+  hintTimer = setTimeout(()=>{ el.style.opacity = "0"; }, 1500);
+}
+
 function endDraw(){
   if (!state.drawing || state.mode !== "draw") return;
   state.drawing = false;
 
-  if (state.drawingOnSurface && drawPlaneInfo && state.localPoints.length >= 3){
-    const geom = makePatchOnPlane(state.localPoints, drawPlaneInfo);
-    addMesh(geom);                      // ← additions do NOT change perspective
+  // If a model already exists, only add if the stroke STARTED on the model
+  if (state.meshes.length > 0) {
+    if (state.drawingOnSurface && drawPlaneInfo && state.localPoints.length >= 3){
+      const geom = makePatchOnPlane(state.localPoints, drawPlaneInfo);
+      addMesh(geom); // no camera change
+    } else {
+      hint("Additions must start on the model.");
+    }
     state.points = []; state.localPoints = []; redrawStroke();
     return;
   }
 
-  // Base object (no hit)
+  // No model yet → create the base object from the freehand stroke
   make3DFromPoints(state.points, state.makeMode);
   state.points = []; redrawStroke();
 }
@@ -280,37 +317,40 @@ function addMesh(geom){
   const mesh = new THREE.Mesh(geom, mat);
   userGroup.add(mesh);
   state.meshes.push(mesh);
-  // 🚫 Do NOT change camera/controls here
 }
 
-// Base mesh: place under where you drew and recenter view ONCE (for first object)
+// Base mesh: set the origin at the FIRST drawing point and keep everything relative to it
 function applyBaseMeshAtStrokeCenter(geom, screenPoints) {
   if (!geom || !screenPoints?.length) return;
 
+  // Determine the anchor (first drawing point) on the floor
+  let anchor = state.originWorld;
+  if (!anchor) {
+    const p0 = screenPoints[0];
+    anchor = screenPointToFloorWorld(p0.x, p0.y);
+    state.originWorld = anchor.clone();
+  }
+
+  // Shift the entire user space so that anchor becomes (0,0,0) in world
+  // (Only x/z need shifting; floor remains in world at its y)
+  originGroup.position.set(-anchor.x, 0, -anchor.z);
+
+  // Build the mesh and place it at the origin, resting on the floor
   const mat = new THREE.MeshStandardMaterial({ color: state.color, metalness: 0.05, roughness: 0.6 });
   const mesh = new THREE.Mesh(geom, mat);
 
-  // center of the stroke in screen space
-  const cx = screenPoints.reduce((s, p) => s + p.x, 0) / screenPoints.length;
-  const cy = screenPoints.reduce((s, p) => s + p.y, 0) / screenPoints.length;
-
-  // project to world (floor plane) and place mesh there, resting on floor
-  const world = screenPointToFloorWorld(cx, cy);
   geom.computeBoundingBox();
   const minY = geom.boundingBox.min.y;
   const pad = 0.02;
-  mesh.position.set(world.x, floor.position.y - minY + pad, world.z);
+  mesh.position.set(0, floor.position.y - minY + pad, 0);
 
   userGroup.add(mesh);
   state.meshes.push(mesh);
 
-  // Recenter perspective at this object while keeping distance/orientation
+  // Recenter OrbitControls once to the origin point, preserving distance/orientation
   const oldTarget = controls.target.clone();
-  const box = new THREE.Box3().setFromObject(mesh);
-  const newTarget = new THREE.Vector3();
-  box.getCenter(newTarget);
-
   const offset = camera.position.clone().sub(oldTarget);
+  const newTarget = new THREE.Vector3(0, floor.position.y, 0); // origin at first drawing point
   camera.position.copy(newTarget.clone().add(offset));
   controls.target.copy(newTarget);
   controls.update();
@@ -321,11 +361,9 @@ function applyMesh(geom){
   geom.center(); geom.computeBoundingBox(); geom.computeBoundingSphere();
   const mat = new THREE.MeshStandardMaterial({ color: state.color, metalness: 0.05, roughness: 0.6 });
   const mesh = new THREE.Mesh(geom, mat);
-  // Sit base on the floor at origin — used only if we don't recenter by stroke
   const minY = geom.boundingBox.min.y;
-  const floorY = floor.position.y;
   const pad = 0.02;
-  mesh.position.set(0, floorY - minY + pad, 0);
+  mesh.position.set(0, floor.position.y - minY + pad, 0);
   userGroup.add(mesh);
   state.meshes.push(mesh);
 }
@@ -336,11 +374,11 @@ function make3DFromPoints(points, mode="extrude"){
   const geom = (mode === "lathe") ? makeLathe(norm) : makeExtrude(norm);
 
   if (state.meshes.length === 0) {
-    // First object: place under where you drew and recenter view
+    // First object: set origin at the FIRST drawing point and recenter once
     applyBaseMeshAtStrokeCenter(geom, points);
   } else {
-    // Later objects: just add, keep perspective
-    addMesh(geom);
+    // Later objects are added only from endDraw if the stroke started on the model
+    // (no-op here)
   }
 }
 
@@ -399,14 +437,14 @@ const undoBtn = addButton("Undo ⬅️", () => {
   if (!m) return;
   userGroup.remove(m);
   m.geometry.dispose(); m.material.dispose();
-  // 🚫 keep the view as-is
+  // keep the view as-is
 });
 
 const clearBtn = addButton("Clear All 🧽", () => {
   state.points = []; state.localPoints = []; redrawStroke();
   state.meshes.forEach(m => { userGroup.remove(m); m.geometry.dispose(); m.material.dispose(); });
   state.meshes = [];
-  // 🚫 keep the view as-is
+  // keep the view as-is (originGroup stays where it is so (0,0,0) is still the first point)
 });
 
 uiBL.append(modeBtn, typeBtn, undoBtn, clearBtn);
@@ -568,7 +606,7 @@ menu.appendChild(makeMenuItem("GLB (glTF 2.0, binary)", () => {
   const exporter = new GLTFExporter();
   exporter.parse(
     userGroup,
-    (buffer) => saveBlob(new Blob([buffer], { type: "model/gltf-binary" }), "kid-3d.glb"),
+    (buffer) => saveBlob(new Blob([buffer], { type: "model/gltf-binary" }), "drawing-3d.glb"),
     { binary: true, onlyVisible: true, forceIndices: true, includeCustomExtensions: false }
   );
 }));
@@ -578,7 +616,7 @@ menu.appendChild(makeMenuItem("GLTF (glTF 2.0, JSON)", () => {
   const exporter = new GLTFExporter();
   exporter.parse(
     userGroup,
-    (gltf) => saveBlob(new Blob([JSON.stringify(gltf)], { type: "model/gltf+json" }), "kid-3d.gltf"),
+    (gltf) => saveBlob(new Blob([JSON.stringify(gltf)], { type: "model/gltf+json" }), "drawing-3d.gltf"),
     { binary: false, onlyVisible: true, forceIndices: true, includeCustomExtensions: false }
   );
 }));
@@ -587,14 +625,14 @@ menu.appendChild(makeMenuItem("STL (geometry only)", () => {
   if (!ensureExportable()) return;
   const exporter = new STLExporter();
   const arrayBuffer = exporter.parse(userGroup, { binary: true });
-  saveBlob(new Blob([arrayBuffer], { type: "model/stl" }), "kid-3d.stl");
+  saveBlob(new Blob([arrayBuffer], { type: "model/stl" }), "drawing-3d.stl");
 }));
 
 menu.appendChild(makeMenuItem("OBJ (geometry + groups)", () => {
   if (!ensureExportable()) return;
   const exporter = new OBJExporter();
   const objText = exporter.parse(userGroup);
-  saveBlob(new Blob([objText], { type: "text/plain" }), "kid-3d.obj");
+  saveBlob(new Blob([objText], { type: "text/plain" }), "drawing-3d.obj");
 }));
 
 // ---------------------------
@@ -631,7 +669,7 @@ function showOnboardingModal() {
       <li>After that, <b>tap the model</b> and draw to add raised patches that <b>stick</b> to the surface.</li>
       <li>Use <b>Mode: Orbit</b> to look around (touch: 1-finger rotate, 2-finger pan/zoom).</li>
       <li>Pick a <b>color</b> in the top-right. Use <b>Undo/Clear</b> in the bottom-left.</li>
-      <li><b>Save</b> from the top-left (GLB / GLTF / STL / OBJ (blender compatible)).</li>
+      <li><b>Save</b> from the top-left (GLB / GLTF / STL / OBJ).</li>
     </ul>
   `;
 
@@ -664,7 +702,7 @@ function showOnboardingModal() {
 
   function close() {
     if (cb.checked) {
-      try { localStorage.setItem("kid3d_onboarded", "1"); } catch {}
+      try { localStorage.setItem("drawing3d_onboarded", "1"); } catch {}
     }
     window.removeEventListener("keydown", onKey);
     overlay.remove();
@@ -683,13 +721,11 @@ function showOnboardingModal() {
 
 // Show once on first load
 try {
-  const skip = localStorage.getItem("kid3d_onboarded") === "1";
+  const skip = localStorage.getItem("drawing3d_onboarded") === "1";
   if (!skip) showOnboardingModal();
 } catch {
-  // If localStorage is blocked, still show it once
   showOnboardingModal();
 }
-
 
 //
 // ---------------------------
