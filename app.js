@@ -424,6 +424,11 @@ function resetViewToIllustration() {
   controls.update();
 }
 
+// Optional desktop shortcut: press "R" to reset view
+addEventListener("keydown", (e) => {
+  if (e.key.toLowerCase?.() === "r") resetViewToIllustration();
+});
+
 //
 // ---------------------------
 // UI — bottom-left controls
@@ -451,16 +456,16 @@ const uiBL = document.createElement("div");
 Object.assign(uiBL.style, { position: "fixed", left: "12px", bottom: "12px", zIndex: "3", display: "flex", flexWrap: "wrap", alignItems: "center" });
 document.body.appendChild(uiBL);
 
-const modeBtn = addButton("Mode: Draw ✍️", () => {
+const modeBtn  = addButton("Mode: Draw ✍️", () => {
   state.mode = state.mode === "draw" ? "orbit" : "draw";
   modeBtn.textContent = state.mode === "draw" ? "Mode: Draw ✍️" : "Mode: Orbit 🌀";
   applyMode();
 });
-const typeBtn = addButton("Make: Extrude 🍪", () => {
+const typeBtn  = addButton("Make: Extrude 🍪", () => {
   state.makeMode = state.makeMode === "extrude" ? "lathe" : "extrude";
   typeBtn.textContent = state.makeMode === "extrude" ? "Make: Extrude 🍪" : "Make: Lathe 🏺";
 });
-const undoBtn = addButton("Undo ⬅️", () => {
+const undoBtn  = addButton("Undo ⬅️", () => {
   const m = state.meshes.pop();
   if (!m) return;
   userGroup.remove(m);
