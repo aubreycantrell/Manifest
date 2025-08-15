@@ -168,6 +168,34 @@ function isConnectedToTarget(localPts, planeInfo, target, geomForBBox) {
 
 //
 // ---------------------------
+// Origin-centered framing (reset + first placement)
+// ---------------------------
+function frameToOrigin(padFactor = 1.8) {
+  // Estimate distance from current content; if empty, use size=1
+  const box = new THREE.Box3().setFromObject(userGroup);
+  let maxSize = 1;
+  if (isFinite(box.min.x)) {
+    const size = new THREE.Vector3(); box.getSize(size);
+    maxSize = Math.max(size.x, size.y, size.z);
+  }
+  const fov = THREE.MathUtils.degToRad(camera.fov);
+  const fitH = maxSize / (2 * Math.tan(fov / 2));
+  const fitW = fitH / camera.aspect;
+  const dist = padFactor * Math.max(fitH, fitW) + 0.5; // farther back
+
+  const origin = new THREE.Vector3(0, 0, 0);
+  const viewDir = new THREE.Vector3(0.8, 0.5, 1).normalize(); // nice diagonal
+
+  controls.target.copy(origin);
+  camera.position.copy(origin.clone().addScaledVector(viewDir, dist));
+  camera.near = Math.max(0.01, dist / 100);
+  camera.far  = Math.max(100,  dist * 10);
+  camera.updateProjectionMatrix();
+  controls.update();
+}
+
+//
+// ---------------------------
 // Drawing events
 // ---------------------------
 function startDraw(e){
@@ -250,7 +278,7 @@ function endDraw(){
     if (state.drawingOnSurface && drawPlaneInfo && state.localPoints.length >= 3){
       const geom = makePatchOnPlane(state.localPoints, drawPlaneInfo);
       if (isConnectedToTarget(state.localPoints, drawPlaneInfo, state.drawTarget, geom)) {
-        addMesh(geom); // keep perspective
+        addMesh(geom); // keep perspective unchanged
       } else {
         hint("Addition ignored: it must stay on the model.");
       }
@@ -338,7 +366,7 @@ function addMesh(geom){
   state.meshes.push(mesh);
 }
 
-// Base mesh: center at world origin on the floor, then center the view ONCE
+// Base mesh: center on world origin (XZ=0,0) resting on floor, then origin-centered view ONCE
 function applyBaseMeshCentered(geom) {
   if (!geom) return;
 
@@ -353,20 +381,8 @@ function applyBaseMeshCentered(geom) {
   userGroup.add(mesh);
   state.meshes.push(mesh);
 
-  // Recenter camera/controls once to the mesh center, preserving offset
-  const oldTarget = controls.target.clone();
-  const offset = camera.position.clone().sub(oldTarget);
-
-  const box = new THREE.Box3().setFromObject(mesh);
-  const newTarget = new THREE.Vector3();
-  box.getCenter(newTarget);
-
-  camera.position.copy(newTarget.clone().add(offset));
-  controls.target.copy(newTarget);
-  camera.near = Math.max(0.01, camera.near);
-  camera.far  = Math.max(100,  camera.far);
-  camera.updateProjectionMatrix();
-  controls.update();
+  // First placement: center view on ORIGIN and sit farther back
+  frameToOrigin(1.8);
 }
 
 function make3DFromPoints(points, mode="extrude"){
@@ -375,7 +391,7 @@ function make3DFromPoints(points, mode="extrude"){
   const geom = (mode === "lathe") ? makeLathe(norm) : makeExtrude(norm);
 
   if (state.meshes.length === 0) {
-    // First object: center on the floor at origin and center the view
+    // First object: center on the floor at origin and center the view to origin
     applyBaseMeshCentered(geom);
   } else {
     // Later objects are only added from endDraw() when stroke started on model
@@ -396,32 +412,10 @@ applyMode();
 
 //
 // ---------------------------
-// Reset View helper & button
+// Reset View helper & button (origin-centered)
 // ---------------------------
 function resetViewToIllustration() {
-  const box = new THREE.Box3().setFromObject(userGroup);
-  if (!isFinite(box.min.x)) return; // nothing yet
-  const center = new THREE.Vector3();
-  const size   = new THREE.Vector3();
-  box.getCenter(center);
-  box.getSize(size);
-
-  let dir = camera.position.clone().sub(controls.target);
-  if (dir.lengthSq() === 0) dir = new THREE.Vector3(0, 0.5, 1);
-  dir.normalize();
-
-  const maxSize = Math.max(size.x, size.y, size.z);
-  const fov     = THREE.MathUtils.degToRad(camera.fov);
-  const fitH    = maxSize / (2 * Math.tan(fov / 2));
-  const fitW    = fitH / camera.aspect;
-  const dist    = 1.2 * Math.max(fitH, fitW); // 20% padding
-
-  controls.target.copy(center);
-  camera.position.copy(center.clone().addScaledVector(dir, dist));
-  camera.near = Math.max(0.01, dist / 100);
-  camera.far  = Math.max(100,  dist * 10);
-  camera.updateProjectionMatrix();
-  controls.update();
+  frameToOrigin(1.8); // tweak pad if you want closer/farther
 }
 
 // Optional desktop shortcut: press "R" to reset view
