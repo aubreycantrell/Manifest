@@ -319,26 +319,15 @@ function addMesh(geom){
   state.meshes.push(mesh);
 }
 
-// Base mesh: set the origin at the FIRST drawing point and keep everything relative to it
-function applyBaseMeshAtStrokeCenter(geom, screenPoints) {
-  if (!geom || !screenPoints?.length) return;
+// Base mesh: center at world origin on the floor, then center the view ONCE
+function applyBaseMeshCentered(geom) {
+  if (!geom) return;
 
-  // Determine the anchor (first drawing point) on the floor
-  let anchor = state.originWorld;
-  if (!anchor) {
-    const p0 = screenPoints[0];
-    anchor = screenPointToFloorWorld(p0.x, p0.y);
-    state.originWorld = anchor.clone();
-  }
-
-  // Shift the entire user space so that anchor becomes (0,0,0) in world
-  // (Only x/z need shifting; floor remains in world at its y)
-  originGroup.position.set(-anchor.x, 0, -anchor.z);
-
-  // Build the mesh and place it at the origin, resting on the floor
+  // Material + mesh
   const mat = new THREE.MeshStandardMaterial({ color: state.color, metalness: 0.05, roughness: 0.6 });
   const mesh = new THREE.Mesh(geom, mat);
 
+  // Make sure geometry is centered, then rest it on the floor and center XZ at (0,0)
   geom.computeBoundingBox();
   const minY = geom.boundingBox.min.y;
   const pad = 0.02;
@@ -347,14 +336,19 @@ function applyBaseMeshAtStrokeCenter(geom, screenPoints) {
   userGroup.add(mesh);
   state.meshes.push(mesh);
 
-  // Recenter OrbitControls once to the origin point, preserving distance/orientation
+  // Recenter the camera/controls ONCE to the mesh center, preserving distance/orientation
   const oldTarget = controls.target.clone();
   const offset = camera.position.clone().sub(oldTarget);
-  const newTarget = new THREE.Vector3(0, floor.position.y, 0); // origin at first drawing point
+
+  const box = new THREE.Box3().setFromObject(mesh);
+  const newTarget = new THREE.Vector3();
+  box.getCenter(newTarget);
+
   camera.position.copy(newTarget.clone().add(offset));
   controls.target.copy(newTarget);
   controls.update();
 }
+
 
 function applyMesh(geom){
   if (!geom) return;
@@ -374,13 +368,14 @@ function make3DFromPoints(points, mode="extrude"){
   const geom = (mode === "lathe") ? makeLathe(norm) : makeExtrude(norm);
 
   if (state.meshes.length === 0) {
-    // First object: set origin at the FIRST drawing point and recenter once
-    applyBaseMeshAtStrokeCenter(geom, points);
+    // First object: center on the floor at origin and center the view
+    applyBaseMeshCentered(geom);
   } else {
-    // Later objects are added only from endDraw if the stroke started on the model
-    // (no-op here)
+    // Later objects: only added from endDraw() when stroke started on model
+    // (no camera changes)
   }
 }
+
 
 //
 // ---------------------------
